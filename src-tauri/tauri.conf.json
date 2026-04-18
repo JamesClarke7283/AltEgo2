@@ -8,11 +8,15 @@
     },
     "windows": [
       {
-        "fullscreen": false,
-        "height": 600,
+        "title": "AltEgo 2",
+        "width": 1400,
+        "height": 900,
+        "minWidth": 1024,
+        "minHeight": 640,
         "resizable": true,
-        "title": "tauri-leptos-example",
-        "width": 800
+        "fullscreen": false,
+        "decorations": false,
+        "center": true
       }
     ],
     "withGlobalTauri": true
@@ -60,11 +64,8 @@
       "timestampUrl": ""
     }
   },
-  "identifier": "cz.michalvavra.taurileptosexample",
-  "plugins": {
-    "cli": {},
-    "updater": {}
-  },
-  "productName": "tauri-leptos-example",
+  "identifier": "cz.altego2.desktop",
+  "plugins": {},
+  "productName": "AltEgo 2",
   "version": "0.0.0"
 }
