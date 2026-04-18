@@ -1,11 +1,9 @@
-![image](https://github.com/JamesClarke7283/TauriLeptosTemplate/assets/78018345/e5f0d309-13f0-4e6e-b4d3-df9e979779ea)
+![image](./Altego2.png)
 
 
 
-# Tauri Leptos Example (With TailwindCSS)
-
-- [Tauri][tauri_web]
-- [Leptos][leptos_repo]
+# AltEgo 2
+A investigative tool like Maltego.
 
 See [Prerequisites](#prerequisites) section.
 
@@ -55,14 +53,3 @@ cargo tauri dev
 ```bash
 cargo tauri build
 ```
-
-## Credits
-
-All credit for the counter example in [`./src-ui/src/lib.rs`](src-ui/src/lib.rs)
-goes to authors and contributors of [gbj/leptos][leptos_repo] GitHub repository,
-[MIT License][leptos_license], Copyright 2022 Greg Johnston.
-
-[tauri_web]: https://tauri.app/
-[leptos_repo]: https://github.com/gbj/leptos
-[leptos_nightly_note]: https://github.com/gbj/leptos#nightly-note
-[leptos_license]: https://github.com/gbj/leptos/blob/e465867b30db8fccce7493f9fc913359246ac4bd/LICENSE
