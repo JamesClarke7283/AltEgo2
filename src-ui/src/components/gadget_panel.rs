@@ -391,6 +391,8 @@ fn toggle_spawn(state: AppState, site: &str, url: &str, favicon_source_url: &str
 
     if tracked_id.is_some() && node_still_exists {
         // --- remove ---
+        // remove_node + edge-prune is already atomic inside the helper,
+        // so no transaction needed here. One click = one undo.
         if let Some(id) = tracked_id {
             state.remove_node(id);
         }
@@ -430,17 +432,22 @@ fn toggle_spawn(state: AppState, site: &str, url: &str, favicon_source_url: &str
     );
 
     let favicon = crate::gadgets::favicon_url(favicon_source_url);
-    let new_id = state.add_node_with_properties(
-        EntityType::Affiliation,
-        pos,
-        &[
-            ("Name", site),
-            ("Network", site),
-            ("Profile URL", url),
-            ("Favicon", favicon.as_deref().unwrap_or("")),
-        ],
-    );
-    let _ = state.add_edge(source_id, new_id);
+    // Spawn-node + connect-edge should be one undo, not two. Wrap in a
+    // transaction so the inner `push_undo_snapshot` calls are no-ops.
+    let new_id = state.with_transaction(|| {
+        let new_id = state.add_node_with_properties(
+            EntityType::Affiliation,
+            pos,
+            &[
+                ("Name", site),
+                ("Network", site),
+                ("Profile URL", url),
+                ("Favicon", favicon.as_deref().unwrap_or("")),
+            ],
+        );
+        let _ = state.add_edge(source_id, new_id);
+        new_id
+    });
 
     run.spawned_nodes.update(|m| {
         m.insert(site.to_string(), new_id);

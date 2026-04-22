@@ -4,9 +4,15 @@
 //! accessed by every component. All reactive pieces live on `RwSignal`s so
 //! updates propagate without prop-drilling.
 
+use std::collections::VecDeque;
+
 use indexmap::IndexMap;
 use leptos::prelude::*;
 use serde::{Deserialize, Serialize};
+
+/// Maximum depth of the undo/redo stacks. 100 is plenty for interactive
+/// editing and caps memory at a few MB even for large graphs.
+const MAX_UNDO_STACK: usize = 100;
 
 // ---------------------------------------------------------------------------
 // Entity types  — 35 variants matching Maltego's Standard entity set.
@@ -428,6 +434,30 @@ pub struct GadgetRun {
 }
 
 // ---------------------------------------------------------------------------
+// Undo / redo snapshots
+// ---------------------------------------------------------------------------
+
+/// An immutable snapshot of the graph. Cheap enough to stash in the
+/// undo/redo stacks even for thousand-node graphs (a single clone of two
+/// `IndexMap`s + a few scalars).
+///
+/// `viewport`, `theme`, `current_file_path`, and everything gadget-related
+/// are **not** included — undo is about graph structure, not cosmetic UI
+/// state.
+#[derive(Clone, Debug)]
+pub struct Snapshot {
+    pub nodes: IndexMap<NodeId, Node>,
+    pub edges: IndexMap<EdgeId, Edge>,
+    pub selection: Selection,
+    pub next_node_id: u64,
+    pub next_edge_id: u64,
+    /// Dirty flag at snapshot time — so undo back past a Save restores
+    /// the "green dot" state, and redo forward into an edit restores the
+    /// "white dot" state.
+    pub is_dirty: bool,
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -456,6 +486,29 @@ pub struct AppState {
     /// Which gadget run the bottom-right results panel is displaying.
     /// `None` = panel hidden.
     pub active_gadget_run: RwSignal<Option<String>>,
+    // --------- dirty / save state ---------
+    /// `true` when the in-memory graph has unsaved changes — i.e. it
+    /// differs from whatever's on disk at `current_file_path` (or, for a
+    /// brand-new untitled graph, differs from "nothing").
+    ///
+    /// Set by mutation helpers (`add_node`, `remove_node`, …), the node-
+    /// drag start, and right-sidebar property edits. Cleared on
+    /// successful save / open / new. Captured in `Snapshot` so
+    /// undo/redo restore the right dirty flag.
+    pub is_dirty: RwSignal<bool>,
+    // --------- undo / redo ---------
+    /// Previous graph states, most-recent last. `push_undo_snapshot()` is
+    /// called at the start of every mutation that participates in undo;
+    /// `undo()` pops from here and applies.
+    pub undo_stack: RwSignal<VecDeque<Snapshot>>,
+    /// States rolled away by `undo()`, most-recently-undone last.
+    /// `redo()` pops from here. Cleared whenever a new mutation happens.
+    pub redo_stack: RwSignal<VecDeque<Snapshot>>,
+    /// Non-zero while a multi-step action is in progress — inner
+    /// mutations skip their own snapshot so the whole action is one
+    /// undo. Use [`AppState::begin_transaction`] / `end_transaction` to
+    /// drive this.
+    pub transaction_depth: RwSignal<usize>,
 }
 
 impl AppState {
@@ -475,6 +528,10 @@ impl AppState {
             context_menu: RwSignal::new(None),
             gadget_runs: RwSignal::new(IndexMap::new()),
             active_gadget_run: RwSignal::new(None),
+            is_dirty: RwSignal::new(false),
+            undo_stack: RwSignal::new(VecDeque::new()),
+            redo_stack: RwSignal::new(VecDeque::new()),
+            transaction_depth: RwSignal::new(0),
         }
     }
 
@@ -484,9 +541,160 @@ impl AppState {
         expect_context::<AppState>()
     }
 
+    // --------- dirty / save state ---------
+
+    /// Mark the graph as having unsaved changes. Idempotent: if the flag
+    /// is already `true`, no signal fire — avoids redundant reactive
+    /// work during long drags / keystroke streams.
+    pub fn mark_dirty(&self) {
+        if !self.is_dirty.get_untracked() {
+            self.is_dirty.set(true);
+        }
+    }
+
+    /// Mark the graph as in-sync with disk. Called by save / load / new.
+    pub fn mark_clean(&self) {
+        if self.is_dirty.get_untracked() {
+            self.is_dirty.set(false);
+        }
+    }
+
+    // --------- undo / redo ---------
+
+    /// Capture the current graph state as a `Snapshot` without pushing it
+    /// to either stack. `undo()` / `redo()` use this to remember the
+    /// "other side" of a roll.
+    fn capture_snapshot(&self) -> Snapshot {
+        Snapshot {
+            nodes: self.nodes.with_untracked(|m| m.clone()),
+            edges: self.edges.with_untracked(|m| m.clone()),
+            selection: self.selection.get_untracked(),
+            next_node_id: self.next_node_id.get_untracked(),
+            next_edge_id: self.next_edge_id.get_untracked(),
+            is_dirty: self.is_dirty.get_untracked(),
+        }
+    }
+
+    /// Swap the current graph state for the given snapshot. The reactive
+    /// `.set()` calls fan out to every subscriber (canvas, sidebar, …).
+    fn apply_snapshot(&self, snap: Snapshot) {
+        self.nodes.set(snap.nodes);
+        self.edges.set(snap.edges);
+        self.selection.set(snap.selection);
+        self.next_node_id.set(snap.next_node_id);
+        self.next_edge_id.set(snap.next_edge_id);
+        self.is_dirty.set(snap.is_dirty);
+    }
+
+    /// Push the current state onto the undo stack and clear redo. Called
+    /// at the *start* of any mutation that should be undoable. While a
+    /// transaction is open this is a no-op — `begin_transaction()`
+    /// already took the one snapshot for the whole group.
+    pub fn push_undo_snapshot(&self) {
+        if self.transaction_depth.get_untracked() > 0 {
+            return;
+        }
+        let snap = self.capture_snapshot();
+        let mut stack = self.undo_stack.get_untracked();
+        stack.push_back(snap);
+        while stack.len() > MAX_UNDO_STACK {
+            stack.pop_front();
+        }
+        self.undo_stack.set(stack);
+        // Any new mutation invalidates the redo future.
+        let mut redo = self.redo_stack.get_untracked();
+        if !redo.is_empty() {
+            redo.clear();
+            self.redo_stack.set(redo);
+        }
+    }
+
+    /// Group several mutations so the whole batch is a single undo step.
+    /// Nest-safe via a depth counter — only the outermost `begin` takes
+    /// a snapshot.
+    ///
+    /// Always pair with [`AppState::end_transaction`], or use the
+    /// [`AppState::with_transaction`] closure wrapper.
+    pub fn begin_transaction(&self) {
+        let depth = self.transaction_depth.get_untracked();
+        if depth == 0 {
+            // Capture BEFORE any mutation happens inside the
+            // transaction. Inner mutations see `depth > 0` and skip
+            // their own snapshots.
+            let snap = self.capture_snapshot();
+            let mut stack = self.undo_stack.get_untracked();
+            stack.push_back(snap);
+            while stack.len() > MAX_UNDO_STACK {
+                stack.pop_front();
+            }
+            self.undo_stack.set(stack);
+            let mut redo = self.redo_stack.get_untracked();
+            if !redo.is_empty() {
+                redo.clear();
+                self.redo_stack.set(redo);
+            }
+        }
+        self.transaction_depth.set(depth + 1);
+    }
+
+    /// End a transaction started by [`AppState::begin_transaction`].
+    pub fn end_transaction(&self) {
+        self.transaction_depth
+            .update(|d| *d = d.saturating_sub(1));
+    }
+
+    /// Convenience wrapper: run `f`, snapshotting once around the whole
+    /// call. Anything `f` does to the graph is a single undo step.
+    pub fn with_transaction<R>(&self, f: impl FnOnce() -> R) -> R {
+        self.begin_transaction();
+        let out = f();
+        self.end_transaction();
+        out
+    }
+
+    /// Roll back to the most recent pre-mutation state. Moves the current
+    /// state onto the redo stack. Returns `true` iff something was
+    /// actually undone.
+    pub fn undo(&self) -> bool {
+        let mut undo = self.undo_stack.get_untracked();
+        let Some(snap) = undo.pop_back() else {
+            return false;
+        };
+        let current = self.capture_snapshot();
+        let mut redo = self.redo_stack.get_untracked();
+        redo.push_back(current);
+        while redo.len() > MAX_UNDO_STACK {
+            redo.pop_front();
+        }
+        self.apply_snapshot(snap);
+        self.undo_stack.set(undo);
+        self.redo_stack.set(redo);
+        true
+    }
+
+    /// Re-apply a state previously rolled away by [`AppState::undo`].
+    /// Returns `true` iff something was actually redone.
+    pub fn redo(&self) -> bool {
+        let mut redo = self.redo_stack.get_untracked();
+        let Some(snap) = redo.pop_back() else {
+            return false;
+        };
+        let current = self.capture_snapshot();
+        let mut undo = self.undo_stack.get_untracked();
+        undo.push_back(current);
+        while undo.len() > MAX_UNDO_STACK {
+            undo.pop_front();
+        }
+        self.apply_snapshot(snap);
+        self.undo_stack.set(undo);
+        self.redo_stack.set(redo);
+        true
+    }
+
     // --------- graph mutations ---------
 
     pub fn add_node(&self, entity_type: EntityType, position: (f64, f64)) -> NodeId {
+        self.push_undo_snapshot();
         let id = NodeId(self.next_node_id.get_untracked());
         self.next_node_id.update(|n| *n += 1);
         let node = Node {
@@ -499,6 +707,7 @@ impl AppState {
             m.insert(id, node);
         });
         self.selection.set(Selection::Node(id));
+        self.mark_dirty();
         id
     }
 
@@ -513,6 +722,7 @@ impl AppState {
         position: (f64, f64),
         overrides: &[(&str, &str)],
     ) -> NodeId {
+        self.push_undo_snapshot();
         let id = NodeId(self.next_node_id.get_untracked());
         self.next_node_id.update(|n| *n += 1);
         let mut properties = entity_type.default_properties();
@@ -530,7 +740,21 @@ impl AppState {
         self.nodes.update(|m| {
             m.insert(id, node);
         });
+        self.mark_dirty();
         id
+    }
+
+    /// Update (or insert) a single property on a node and mark the graph
+    /// dirty. Does NOT participate in undo — per-keystroke snapshots
+    /// would balloon the undo stack. A future improvement is to
+    /// debounce-snapshot on blur, tracked separately.
+    pub fn update_node_property(&self, id: NodeId, key: &str, value: String) {
+        self.nodes.update(|m| {
+            if let Some(n) = m.get_mut(&id) {
+                n.properties.insert(key.to_string(), value);
+            }
+        });
+        self.mark_dirty();
     }
 
     /// Remove a node by id, also pruning every edge that touches it.
@@ -543,6 +767,7 @@ impl AppState {
         if !existed {
             return false;
         }
+        self.push_undo_snapshot();
         self.nodes.update(|m| {
             m.shift_remove(&id);
         });
@@ -554,6 +779,27 @@ impl AppState {
         if self.selection.get_untracked() == Selection::Node(id) {
             self.selection.set(Selection::None);
         }
+        self.mark_dirty();
+        true
+    }
+
+    /// Remove a single edge by id. No-op if it doesn't exist. Clears
+    /// selection if the removed edge was selected.
+    pub fn remove_edge(&self, id: EdgeId) -> bool {
+        let existed = self
+            .edges
+            .with_untracked(|m| m.contains_key(&id));
+        if !existed {
+            return false;
+        }
+        self.push_undo_snapshot();
+        self.edges.update(|m| {
+            m.shift_remove(&id);
+        });
+        if self.selection.get_untracked() == Selection::Edge(id) {
+            self.selection.set(Selection::None);
+        }
+        self.mark_dirty();
         true
     }
 
@@ -570,11 +816,15 @@ impl AppState {
         if exists {
             return None;
         }
+        // Snapshot AFTER early-returns so no-op calls don't pollute the
+        // undo stack with identical-looking entries.
+        self.push_undo_snapshot();
         let id = EdgeId(self.next_edge_id.get_untracked());
         self.next_edge_id.update(|n| *n += 1);
         self.edges.update(|m| {
             m.insert(id, Edge { id, from, to, label: None });
         });
+        self.mark_dirty();
         Some(id)
     }
 
@@ -585,6 +835,8 @@ impl AppState {
         self.viewport.set(Viewport::default());
         self.drag.set(DragKind::None);
         self.current_file_path.set(None);
+        // Fresh empty graph matches "nothing on disk" — start clean.
+        self.mark_clean();
     }
 
     pub fn toggle_theme(&self) {
@@ -631,6 +883,9 @@ impl AppState {
         self.selection.set(Selection::None);
         self.viewport.set(Viewport::default());
         self.drag.set(DragKind::None);
+        // Freshly loaded from disk — the in-memory state matches the
+        // file byte-for-byte.
+        self.mark_clean();
     }
 }
 

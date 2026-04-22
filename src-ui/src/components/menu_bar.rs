@@ -9,6 +9,7 @@ use wasm_bindgen::{closure::Closure, JsCast};
 use wasm_bindgen_futures::spawn_local;
 use web_sys::Element;
 
+use crate::actions;
 use crate::components::icons::IconCheck;
 use crate::state::{AppState, GraphFile, Theme};
 use crate::tauri_bridge;
@@ -86,34 +87,20 @@ fn FileMenu() -> impl IntoView {
 
     let on_new = move |_| state.clear();
 
-    // "Save": write directly to `current_file_path` if we have one, otherwise
-    // fall back to Save As (dialog).
+    // "Save" → shared `actions::save` helper (same path the Ctrl+S
+    // hotkey uses). Pops Save-As if no file has been named yet;
+    // otherwise writes silently.
     let on_save = move |_| {
-        let maybe_path = state.current_file_path.get_untracked();
-        let graph = state.snapshot_graph_file();
         spawn_local(async move {
-            let json = match serde_json::to_string_pretty(&graph) {
-                Ok(s) => s,
-                Err(e) => {
-                    alert(&format!("Failed to serialise graph:\n{e}"));
-                    return;
-                }
-            };
-            match maybe_path {
-                Some(path) => match tauri_bridge::save_graph_to(path, json).await {
-                    Ok(()) => { /* saved silently */ }
-                    Err(e) => alert(&format!("Save failed:\n{e}")),
-                },
-                None => match tauri_bridge::save_graph(json).await {
-                    Ok(Some(path)) => state.current_file_path.set(Some(path)),
-                    Ok(None) => { /* user cancelled */ }
-                    Err(e) => alert(&format!("Save failed:\n{e}")),
-                },
+            if let Err(msg) = actions::save(state).await {
+                alert(&msg);
             }
         });
     };
 
-    // "Save As…": always show the dialog, then remember the returned path.
+    // "Save As…": always show the dialog, then remember the returned
+    // path. Distinct from `actions::save` which short-circuits to the
+    // existing path when one is set.
     let on_save_as = move |_| {
         let graph = state.snapshot_graph_file();
         spawn_local(async move {
@@ -125,7 +112,10 @@ fn FileMenu() -> impl IntoView {
                 }
             };
             match tauri_bridge::save_graph(json).await {
-                Ok(Some(path)) => state.current_file_path.set(Some(path)),
+                Ok(Some(path)) => {
+                    state.current_file_path.set(Some(path));
+                    state.mark_clean();
+                }
                 Ok(None) => { /* user cancelled */ }
                 Err(e) => alert(&format!("Save failed:\n{e}")),
             }
@@ -139,6 +129,9 @@ fn FileMenu() -> impl IntoView {
                     Ok(graph) => {
                         state.load_graph_file(graph);
                         state.current_file_path.set(Some(loaded.path));
+                        // `load_graph_file` already marks clean, but be
+                        // explicit so future refactors can't drift.
+                        state.mark_clean();
                     }
                     Err(e) => alert(&format!("Failed to parse {}:\n{}", loaded.path, e)),
                 },

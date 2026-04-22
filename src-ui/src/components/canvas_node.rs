@@ -68,6 +68,13 @@ pub fn NodeView(node_id: NodeId) -> impl IntoView {
             .nodes
             .with_untracked(|m| m.get(&node_id).map(|n| n.position))
             .unwrap_or((0.0, 0.0));
+        // Snapshot the whole drag as one undo step, and flip the dirty
+        // flag once at drag start. The subsequent per-pointer-move
+        // `nodes.update(...)` calls in `canvas.rs` do NOT snapshot and
+        // do NOT re-mark dirty — they'd otherwise create an undo entry
+        // per pixel and churn the dirty signal every frame.
+        state.push_undo_snapshot();
+        state.mark_dirty();
         let world = client_to_world(ev.client_x() as f64, ev.client_y() as f64, state);
         state.drag.set(DragKind::MoveNode {
             id: node_id,

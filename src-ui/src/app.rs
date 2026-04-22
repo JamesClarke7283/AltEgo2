@@ -10,6 +10,7 @@ use crate::components::menu_bar::MenuBar;
 use crate::components::palette::EntityPalette;
 use crate::components::right_sidebar::RightSidebar;
 use crate::components::title_bar::TitleBar;
+use crate::hotkeys;
 use crate::state::AppState;
 use crate::theme;
 
@@ -18,6 +19,7 @@ pub fn App() -> impl IntoView {
     let state = AppState::new();
     provide_context(state);
     theme::init(state);
+    hotkeys::install(state);
 
     view! {
         <div class="h-screen w-screen flex flex-col \

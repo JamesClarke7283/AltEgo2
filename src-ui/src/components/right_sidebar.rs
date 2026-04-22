@@ -178,14 +178,10 @@ fn PropertyEditor(node_id: crate::state::NodeId) -> impl IntoView {
                 };
                 let on_input = move |ev: web_sys::Event| {
                     let v = event_target_value(&ev);
-                    let k = key_for_set.clone();
-                    state.nodes.update(|m| {
-                        if let Some(n) = m.get_mut(&node_id) {
-                            if let Some(slot) = n.properties.get_mut(&k) {
-                                *slot = v;
-                            }
-                        }
-                    });
+                    // Goes through the AppState helper so the dirty
+                    // flag flips on the first keystroke (→ title-bar
+                    // dot turns white + pulsing).
+                    state.update_node_property(node_id, &key_for_set, v);
                 };
                 view! {
                     <label class="block">

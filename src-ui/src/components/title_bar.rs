@@ -32,6 +32,28 @@ pub fn TitleBar() -> impl IntoView {
             .unwrap_or_default()
     };
 
+    // Dirty-state dot. White + pulsing when there are unsaved changes;
+    // a calm green when the in-memory graph matches disk. Always
+    // rendered (including for brand-new untitled graphs) so the user
+    // has a constant at-a-glance save-state indicator.
+    let dirty = move || state.is_dirty.get();
+    let dot_class = move || {
+        if dirty() {
+            "ml-2 w-2 h-2 rounded-full bg-white shrink-0 \
+             shadow-[0_0_8px_2px_rgba(255,255,255,0.9)] animate-pulse"
+        } else {
+            "ml-2 w-2 h-2 rounded-full bg-emerald-500 shrink-0 \
+             shadow-[0_0_4px_1px_rgba(16,185,129,0.6)]"
+        }
+    };
+    let dot_title = move || {
+        if dirty() {
+            "Unsaved changes"
+        } else {
+            "Saved"
+        }
+    };
+
     view! {
         <div
             data-tauri-drag-region="true"
@@ -52,6 +74,7 @@ pub fn TitleBar() -> impl IntoView {
                 <span class="text-xs font-semibold tracking-[0.2em] truncate">
                     "ALTEGO 2"{file_suffix}
                 </span>
+                <span class=dot_class title=dot_title></span>
             </div>
             <div class="flex items-center h-full no-drag">
                 <TitleBarButton on_click=Box::new(on_minimize) kind=ButtonKind::Normal title="Minimize">
