@@ -36,14 +36,24 @@ pub fn TitleBar() -> impl IntoView {
     // a calm green when the in-memory graph matches disk. Always
     // rendered (including for brand-new untitled graphs) so the user
     // has a constant at-a-glance save-state indicator.
+    //
+    // Halo uses an inline `box-shadow` instead of a Tailwind
+    // `shadow-[…]` arbitrary value — Tailwind v4 doesn't extract those
+    // from `.rs` files in this project, so the class would produce no
+    // CSS and the dot would render without its glow.
     let dirty = move || state.is_dirty.get();
     let dot_class = move || {
         if dirty() {
-            "ml-2 w-2 h-2 rounded-full bg-white shrink-0 \
-             shadow-[0_0_8px_2px_rgba(255,255,255,0.9)] animate-pulse"
+            "ml-2 w-2 h-2 rounded-full bg-white shrink-0 animate-pulse"
         } else {
-            "ml-2 w-2 h-2 rounded-full bg-emerald-500 shrink-0 \
-             shadow-[0_0_4px_1px_rgba(16,185,129,0.6)]"
+            "ml-2 w-2 h-2 rounded-full bg-emerald-500 shrink-0"
+        }
+    };
+    let dot_style = move || {
+        if dirty() {
+            "box-shadow: 0 0 8px 2px rgba(255,255,255,0.9);"
+        } else {
+            "box-shadow: 0 0 4px 1px rgba(16,185,129,0.6);"
         }
     };
     let dot_title = move || {
@@ -74,7 +84,7 @@ pub fn TitleBar() -> impl IntoView {
                 <span class="text-xs font-semibold tracking-[0.2em] truncate">
                     "ALTEGO 2"{file_suffix}
                 </span>
-                <span class=dot_class title=dot_title></span>
+                <span class=dot_class style=dot_style title=dot_title></span>
             </div>
             <div class="flex items-center h-full no-drag">
                 <TitleBarButton on_click=Box::new(on_minimize) kind=ButtonKind::Normal title="Minimize">

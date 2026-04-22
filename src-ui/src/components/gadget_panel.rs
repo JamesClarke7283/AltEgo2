@@ -78,14 +78,20 @@ fn PanelBody() -> impl IntoView {
     });
 
     view! {
+        // NB: width / max-height / z-index are inline styles rather than
+        // Tailwind arbitrary-value classes (`w-[420px]`, `max-h-[70vh]`,
+        // `z-[999]`). The project's Tailwind v4 scanner doesn't extract
+        // bracketed values from `.rs` source files, so those classes
+        // would silently produce no CSS — rendering the panel with zero
+        // width and the sidebar on top of it.
         <div
-            class="fixed bottom-4 right-4 w-[420px] max-h-[70vh] \
+            class="fixed bottom-4 right-4 \
                    flex flex-col rounded-md shadow-2xl \
                    bg-white dark:bg-zinc-900 \
                    border border-zinc-200 dark:border-zinc-700 \
-                   text-sm text-zinc-700 dark:text-zinc-200 \
-                   z-[999]"
-            style="backdrop-filter: blur(6px); contain: layout paint;"
+                   text-sm text-zinc-700 dark:text-zinc-200"
+            style="width: 420px; max-height: 70vh; z-index: 999; \
+                   backdrop-filter: blur(6px); contain: layout paint;"
         >
             // Header
             <div class="flex items-center gap-2 px-3 py-2 \
