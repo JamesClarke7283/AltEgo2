@@ -72,7 +72,13 @@ fn run_check_username(state: AppState, node: &Node) {
         .unwrap_or_default()
         .trim()
         .to_string();
+    log::info!(
+        "[gadget] run_check_username invoked (username={:?}, node_id={:?})",
+        username,
+        node.id
+    );
     if username.is_empty() {
+        log::warn!("[gadget] aborting: Handle is empty");
         if let Some(w) = web_sys::window() {
             let _ = w.alert_with_message(
                 "Set a Handle on this Alias before running the username check.",
@@ -86,8 +92,6 @@ fn run_check_username(state: AppState, node: &Node) {
     let title = format!("Check Username: {username}");
     let run_id_for_state = run_id.clone();
     let source_node_id = node.id;
-    // All the rapidly-changing fields are RwSignals, so the outer
-    // IndexMap only invalidates on structural change (run added/removed).
     let new_run = GadgetRun {
         run_id: run_id_for_state.clone(),
         title: title.clone(),
@@ -104,60 +108,89 @@ fn run_check_username(state: AppState, node: &Node) {
         runs.insert(run_id_for_state, new_run);
     });
     state.active_gadget_run.set(Some(run_id.clone()));
+    log::info!("[gadget] GadgetRun seeded, panel should now be visible (run_id={run_id})");
 
-    // ---- 3. subscribe + invoke in a single task ----
+    // ---- 3. subscribe BEFORE invoking ----
     //
-    // We own the event-name String for the whole task scope, then drive
-    // both the progress-listen and the invoke concurrently via
-    // `futures::join!`. This avoids a nested spawn_local (which would
-    // require `'static` captures and trip the Rust 2024 `impl Trait`
-    // capture rule on the stream's lifetime).
+    // The backend starts emitting `gadget-progress::<run_id>` events as
+    // soon as the runner's first Progress lands on its mpsc channel —
+    // which can happen within a few ms after invoke reaches the backend.
+    // If we started both concurrently (`join!`), a fast backend could
+    // beat our listener subscription and we'd miss the first batch
+    // (which carries the `total` count, so the progress bar would stay
+    // at 0 until the final-Vec sync on completion — no live feed).
+    //
+    // Fix: `listen().await` FIRST, so the subscription is live at the
+    // webview layer, THEN spawn the invoke + pump concurrently.
     let event_name = format!("gadget-progress::{run_id}");
     let run_id_for_invoke = run_id.clone();
     let run_id_for_pump = run_id.clone();
 
     spawn_local(async move {
-        // Snapshot the RwSignal handles for this run once. They're Copy
-        // so we can move them freely into each sub-task.
-        let run_signals = state
+        // Grab the RwSignal handles for this run. They're Copy (integer
+        // IDs) so we can move them freely into each inner task.
+        let Some(run) = state
             .gadget_runs
-            .with_untracked(|m| m.get(&run_id_for_pump).cloned());
+            .with_untracked(|m| m.get(&run_id_for_pump).cloned())
+        else {
+            log::error!("[gadget] lost our own run in gadget_runs map; aborting");
+            return;
+        };
 
-        // IMPORTANT: subscribe BEFORE invoking, or we risk missing the
-        // first few progress events. `listen` resolves once the
-        // subscription is confirmed with the webview.
-        let pump = async {
-            let Some(run) = run_signals.clone() else { return };
-            match tauri_wasm_rs::api::event::listen::<ProgressBatch>(&event_name).await {
-                Ok(mut stream) => {
-                    use futures::StreamExt;
-                    while let Some(ev) = stream.next().await {
-                        let batch = ev.payload;
-                        // One reactive update per batch (typically 10–50
-                        // results), not one per site. This is the main
-                        // perf win: 3 000 events → ~60 update cycles.
-                        run.completed.set(batch.completed);
-                        run.total.set(batch.total);
-                        if !batch.new_results.is_empty() {
-                            run.counts.update(|c| {
-                                for r in &batch.new_results {
-                                    c.bump(&r.status);
-                                }
-                            });
-                            run.results.update(|v| v.extend(batch.new_results));
-                        }
-                    }
-                }
-                Err(e) => {
-                    log::warn!(
-                        "gadget listen failed, proceeding without live updates: {e:?}"
-                    );
-                }
+        // Subscribe FIRST — completes when the webview has confirmed the
+        // listener. Any events emitted after this point are buffered in
+        // the stream until we start polling.
+        log::info!("[gadget] subscribing to event stream: {event_name}");
+        let stream = match tauri_wasm_rs::api::event::listen::<ProgressBatch>(&event_name).await {
+            Ok(s) => {
+                log::info!("[gadget] listener registered");
+                Some(s)
+            }
+            Err(e) => {
+                log::warn!(
+                    "[gadget] listener failed ({e:?}); proceeding with final-result sync only"
+                );
+                None
             }
         };
 
-        // ---- 4. invoke the command and await the final Vec ----
+        // Now that the subscription is live, pump and invoke can run
+        // concurrently without racing.
+        let pump = async {
+            let Some(mut stream) = stream else { return };
+            use futures::StreamExt;
+            let mut batches_seen = 0usize;
+            while let Some(ev) = stream.next().await {
+                let batch = ev.payload;
+                batches_seen += 1;
+                if batches_seen == 1 || batches_seen % 20 == 0 {
+                    log::debug!(
+                        "[gadget] batch #{} (completed={}/{}, +{} results)",
+                        batches_seen,
+                        batch.completed,
+                        batch.total,
+                        batch.new_results.len()
+                    );
+                }
+                // One reactive update per batch (typically 10–50
+                // results), not one per site. This is the main perf win:
+                // 3 000 events → ~60 update cycles.
+                run.completed.set(batch.completed);
+                run.total.set(batch.total);
+                if !batch.new_results.is_empty() {
+                    run.counts.update(|c| {
+                        for r in &batch.new_results {
+                            c.bump(&r.status);
+                        }
+                    });
+                    run.results.update(|v| v.extend(batch.new_results));
+                }
+            }
+            log::info!("[gadget] event stream ended after {batches_seen} batches");
+        };
+
         let invoke = async {
+            log::info!("[gadget] invoking backend command");
             match tauri_bridge::gadget_check_username_streaming(
                 run_id_for_invoke.clone(),
                 username,
@@ -165,38 +198,39 @@ fn run_check_username(state: AppState, node: &Node) {
             .await
             {
                 Ok(final_results) => {
-                    if let Some(run) = run_signals.clone() {
-                        // Recompute counts from scratch on the final list
-                        // so we can't drift from dropped events.
-                        let mut counts = StatusCounts::default();
-                        for r in &final_results {
-                            counts.bump(&r.status);
-                        }
-                        let len = final_results.len();
-                        run.results.set(final_results);
-                        run.counts.set(counts);
-                        run.completed.set(len);
-                        run.total.update(|t| {
-                            if *t < len {
-                                *t = len;
-                            }
-                        });
-                        run.finished.set(true);
+                    log::info!(
+                        "[gadget] backend returned {} results",
+                        final_results.len()
+                    );
+                    // Recompute counts from scratch on the final list so
+                    // we can't drift from dropped events.
+                    let mut counts = StatusCounts::default();
+                    for r in &final_results {
+                        counts.bump(&r.status);
                     }
+                    let len = final_results.len();
+                    run.results.set(final_results);
+                    run.counts.set(counts);
+                    run.completed.set(len);
+                    run.total.update(|t| {
+                        if *t < len {
+                            *t = len;
+                        }
+                    });
+                    run.finished.set(true);
                 }
                 Err(e) => {
-                    if let Some(run) = run_signals.clone() {
-                        run.error.set(Some(e));
-                        run.finished.set(true);
-                    }
+                    log::error!("[gadget] backend error: {e}");
+                    run.error.set(Some(e));
+                    run.finished.set(true);
                 }
             }
         };
 
-        // Run both concurrently. The pump loop exits naturally when the
-        // backend stops emitting (which happens after `invoke` resolves
-        // and the forwarder task drops its mpsc sender).
+        // Pump exits when the backend stops emitting (channel closes
+        // after invoke resolves). Invoke resolves when the sweep ends.
         futures::join!(pump, invoke);
+        log::info!("[gadget] run {run_id_for_pump} fully drained");
     });
 }
 
