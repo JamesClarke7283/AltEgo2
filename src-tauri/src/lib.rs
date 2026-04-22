@@ -3,7 +3,7 @@
     windows_subsystem = "windows"
 )]
 
-use gadgets_maigret::{CheckOptions, Progress, SiteCheckResult};
+use gadgets_maigret::{CheckOptions, Progress, ProgressBatch, SiteCheckResult};
 use tauri::{AppHandle, Emitter, Window};
 use tauri_plugin_dialog::DialogExt;
 
@@ -120,25 +120,95 @@ async fn gadget_check_username(username: String) -> Result<Vec<SiteCheckResult>,
     gadgets_maigret::check_username(&username).await
 }
 
-/// Streaming username sweep. Emits `gadget-progress::<run_id>` Tauri events
-/// as each site finishes, then resolves with the final sorted `Vec`.
+/// Streaming username sweep. Emits batched `gadget-progress::<run_id>`
+/// Tauri events as sites finish, then resolves with the final sorted
+/// `Vec`.
 ///
 /// The frontend supplies `run_id` (any opaque string) before invoking, so
 /// it can subscribe to the per-run event channel *before* results start
-/// arriving. We spawn a small forwarder task that drains the mpsc channel
-/// into `app.emit(...)` — this decouples the Maigret runner from Tauri.
+/// arriving. We spawn a forwarder task that drains the mpsc channel,
+/// coalesces up to `FLUSH_INTERVAL_MS` worth of results into one
+/// `ProgressBatch`, and emits that — ~30 Tauri IPC calls/second instead
+/// of ~50–100/s, cutting webview jank.
 #[tauri::command]
 async fn gadget_check_username_streaming(
     app: AppHandle,
     run_id: String,
     username: String,
 ) -> Result<Vec<SiteCheckResult>, String> {
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Progress>(64);
+    /// Flush cadence for batched progress events. 33 ms ≈ 30 Hz, which is
+    /// smoother than any human can perceive and also matches a 30 FPS
+    /// animation budget. Dropping to 16 ms (60 Hz) spends too much CPU on
+    /// IPC serialisation for negligible perceptual gain.
+    const FLUSH_INTERVAL_MS: u64 = 33;
+
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Progress>(128);
     let progress_event = format!("gadget-progress::{run_id}");
     let app_bg = app.clone();
     tokio::spawn(async move {
-        while let Some(p) = rx.recv().await {
-            let _ = app_bg.emit(&progress_event, &p);
+        let mut interval =
+            tokio::time::interval(std::time::Duration::from_millis(FLUSH_INTERVAL_MS));
+        // Don't fire make-up ticks after a blocking period — we only care
+        // about the *next* flush window.
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // Skip the immediate first tick; otherwise we'd flush an empty
+        // batch before any results exist.
+        let _ = interval.tick().await;
+
+        let mut pending: Vec<SiteCheckResult> = Vec::new();
+        let mut completed = 0usize;
+        let mut total = 0usize;
+        let mut dirty = false;
+        let mut closed = false;
+
+        while !closed {
+            tokio::select! {
+                biased;
+                msg = rx.recv() => {
+                    match msg {
+                        Some(p) => {
+                            completed = p.completed;
+                            total = p.total;
+                            if let Some(r) = p.last {
+                                pending.push(r);
+                            }
+                            dirty = true;
+                        }
+                        None => {
+                            closed = true;
+                        }
+                    }
+                }
+                _ = interval.tick() => {
+                    if dirty {
+                        let _ = app_bg.emit(
+                            &progress_event,
+                            &ProgressBatch {
+                                completed,
+                                total,
+                                new_results: std::mem::take(&mut pending),
+                            },
+                        );
+                        dirty = false;
+                    }
+                }
+            }
+        }
+
+        // Trailing flush — make sure any last results queued between the
+        // final tick and channel close arrive at the UI. The frontend
+        // also syncs against the invoke's final Vec, so this is belt-
+        // and-braces, but keeps the live feed in-sync if the user is
+        // watching at the moment the run finishes.
+        if dirty || !pending.is_empty() {
+            let _ = app_bg.emit(
+                &progress_event,
+                &ProgressBatch {
+                    completed,
+                    total,
+                    new_results: std::mem::take(&mut pending),
+                },
+            );
         }
     });
     gadgets_maigret::check_username_streaming(&username, CheckOptions::default(), tx).await

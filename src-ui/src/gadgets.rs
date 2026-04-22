@@ -11,7 +11,7 @@
 use leptos::prelude::*;
 use wasm_bindgen_futures::spawn_local;
 
-use gadgets_maigret::Progress;
+use gadgets_maigret::{ProgressBatch, StatusCounts};
 use indexmap::IndexMap;
 
 use crate::state::{AppState, EntityType, GadgetRun, Node};
@@ -86,21 +86,22 @@ fn run_check_username(state: AppState, node: &Node) {
     let title = format!("Check Username: {username}");
     let run_id_for_state = run_id.clone();
     let source_node_id = node.id;
+    // All the rapidly-changing fields are RwSignals, so the outer
+    // IndexMap only invalidates on structural change (run added/removed).
+    let new_run = GadgetRun {
+        run_id: run_id_for_state.clone(),
+        title: title.clone(),
+        source_node_id,
+        completed: RwSignal::new(0),
+        total: RwSignal::new(0),
+        results: RwSignal::new(Vec::new()),
+        counts: RwSignal::new(StatusCounts::default()),
+        spawned_nodes: RwSignal::new(IndexMap::new()),
+        finished: RwSignal::new(false),
+        error: RwSignal::new(None),
+    };
     state.gadget_runs.update(|runs: &mut IndexMap<String, GadgetRun>| {
-        runs.insert(
-            run_id_for_state.clone(),
-            GadgetRun {
-                run_id: run_id_for_state,
-                title: title.clone(),
-                source_node_id,
-                completed: 0,
-                total: 0,
-                results: Vec::new(),
-                spawned_nodes: IndexMap::new(),
-                finished: false,
-                error: None,
-            },
-        );
+        runs.insert(run_id_for_state, new_run);
     });
     state.active_gadget_run.set(Some(run_id.clone()));
 
@@ -116,24 +117,35 @@ fn run_check_username(state: AppState, node: &Node) {
     let run_id_for_pump = run_id.clone();
 
     spawn_local(async move {
+        // Snapshot the RwSignal handles for this run once. They're Copy
+        // so we can move them freely into each sub-task.
+        let run_signals = state
+            .gadget_runs
+            .with_untracked(|m| m.get(&run_id_for_pump).cloned());
+
         // IMPORTANT: subscribe BEFORE invoking, or we risk missing the
         // first few progress events. `listen` resolves once the
         // subscription is confirmed with the webview.
         let pump = async {
-            match tauri_wasm_rs::api::event::listen::<Progress>(&event_name).await {
+            let Some(run) = run_signals.clone() else { return };
+            match tauri_wasm_rs::api::event::listen::<ProgressBatch>(&event_name).await {
                 Ok(mut stream) => {
                     use futures::StreamExt;
                     while let Some(ev) = stream.next().await {
-                        let p = ev.payload;
-                        state.gadget_runs.update(|runs| {
-                            if let Some(run) = runs.get_mut(&run_id_for_pump) {
-                                run.completed = p.completed;
-                                run.total = p.total;
-                                if let Some(r) = p.last {
-                                    run.results.push(r);
+                        let batch = ev.payload;
+                        // One reactive update per batch (typically 10–50
+                        // results), not one per site. This is the main
+                        // perf win: 3 000 events → ~60 update cycles.
+                        run.completed.set(batch.completed);
+                        run.total.set(batch.total);
+                        if !batch.new_results.is_empty() {
+                            run.counts.update(|c| {
+                                for r in &batch.new_results {
+                                    c.bump(&r.status);
                                 }
-                            }
-                        });
+                            });
+                            run.results.update(|v| v.extend(batch.new_results));
+                        }
                     }
                 }
                 Err(e) => {
@@ -153,26 +165,30 @@ fn run_check_username(state: AppState, node: &Node) {
             .await
             {
                 Ok(final_results) => {
-                    state.gadget_runs.update(|runs| {
-                        if let Some(run) = runs.get_mut(&run_id_for_invoke) {
-                            run.results = final_results;
-                            run.finished = true;
-                            // If the backend's tally raced ahead of our
-                            // event stream (we dropped events), reconcile.
-                            run.completed = run.results.len();
-                            if run.total < run.completed {
-                                run.total = run.completed;
-                            }
+                    if let Some(run) = run_signals.clone() {
+                        // Recompute counts from scratch on the final list
+                        // so we can't drift from dropped events.
+                        let mut counts = StatusCounts::default();
+                        for r in &final_results {
+                            counts.bump(&r.status);
                         }
-                    });
+                        let len = final_results.len();
+                        run.results.set(final_results);
+                        run.counts.set(counts);
+                        run.completed.set(len);
+                        run.total.update(|t| {
+                            if *t < len {
+                                *t = len;
+                            }
+                        });
+                        run.finished.set(true);
+                    }
                 }
                 Err(e) => {
-                    state.gadget_runs.update(|runs| {
-                        if let Some(run) = runs.get_mut(&run_id_for_invoke) {
-                            run.error = Some(e);
-                            run.finished = true;
-                        }
-                    });
+                    if let Some(run) = run_signals.clone() {
+                        run.error.set(Some(e));
+                        run.finished.set(true);
+                    }
                 }
             }
         };
@@ -191,4 +207,40 @@ fn generate_run_id() -> String {
     let ms = js_sys::Date::now() as u64;
     let rand = (js_sys::Math::random() * 1_000_000_000.0) as u64;
     format!("run-{ms}-{rand}")
+}
+
+/// Build a favicon URL for a given site URL.
+///
+/// Uses Google's public `s2/favicons` service, which:
+///   * works for any public site without CORS fuss (browsers treat it as
+///     an `<img>` source, not an API call);
+///   * falls back to a sensible placeholder when the site doesn't serve a
+///     favicon at a discoverable location;
+///   * normalises size — we always get a 64 × 64 PNG.
+///
+/// Returns `None` if we can't extract a host from the input URL (unlikely;
+/// Maigret URLs always look like `https://host/{username}`).
+pub fn favicon_url(site_url: &str) -> Option<String> {
+    let host = host_of(site_url)?;
+    Some(format!(
+        "https://www.google.com/s2/favicons?domain={host}&sz=64"
+    ))
+}
+
+/// Extract the host component from a URL without pulling in the `url`
+/// crate (which isn't in the frontend dep graph). Handles `http://` and
+/// `https://` prefixes; everything else returns `None`.
+fn host_of(url: &str) -> Option<&str> {
+    let after_scheme = url
+        .strip_prefix("https://")
+        .or_else(|| url.strip_prefix("http://"))?;
+    let end = after_scheme
+        .find(|c: char| c == '/' || c == ':' || c == '?' || c == '#')
+        .unwrap_or(after_scheme.len());
+    let host = &after_scheme[..end];
+    if host.is_empty() {
+        None
+    } else {
+        Some(host)
+    }
 }

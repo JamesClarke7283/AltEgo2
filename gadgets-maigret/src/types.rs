@@ -6,7 +6,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Result of a single site check.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SiteCheckResult {
     /// Human-readable site name, e.g. `"GitHub"`.
     pub site: String,
@@ -44,7 +44,10 @@ pub enum CheckStatus {
     Error { reason: String },
 }
 
-/// Progress update emitted while a run is in flight.
+/// Progress update emitted on the *runner's* mpsc channel — one per
+/// completed site. The Tauri forwarder coalesces a burst of these into a
+/// single `ProgressBatch` at ~30 Hz to avoid DoS'ing the webview's event
+/// pipe.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Progress {
     /// How many sites have finished so far.
@@ -54,6 +57,45 @@ pub struct Progress {
     /// Most recent result, so the UI can stream a live feed. `None` for the
     /// initial "we've loaded the DB, here's the total" message.
     pub last: Option<SiteCheckResult>,
+}
+
+/// Batched progress event sent over the Tauri event bus to the frontend.
+/// Accumulates every new result that finished since the previous flush
+/// (typically 0–50 items per ~33 ms window). The frontend processes the
+/// whole batch in one reactive update, so 3 000 individual events don't
+/// trigger 3 000 DOM invalidations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressBatch {
+    /// Cumulative completed count at flush time.
+    pub completed: usize,
+    /// Total sites in the run.
+    pub total: usize,
+    /// Results that arrived since the last batch. Empty on pure heartbeat
+    /// ticks (e.g. the initial "DB loaded" notification).
+    pub new_results: Vec<SiteCheckResult>,
+}
+
+/// Per-status hit counts — kept as a cached field on `GadgetRun` in the
+/// frontend so the filter-pill badges are O(1) instead of re-scanning the
+/// full result list every render.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusCounts {
+    pub claimed: usize,
+    pub available: usize,
+    pub unknown: usize,
+    pub error: usize,
+}
+
+impl StatusCounts {
+    /// Increment the counter matching `status`.
+    pub fn bump(&mut self, status: &CheckStatus) {
+        match status {
+            CheckStatus::Claimed => self.claimed += 1,
+            CheckStatus::Available => self.available += 1,
+            CheckStatus::Unknown { .. } | CheckStatus::Invalid { .. } => self.unknown += 1,
+            CheckStatus::Error { .. } => self.error += 1,
+        }
+    }
 }
 
 /// Tunables for a username check. `Default` is what the UI uses; the public

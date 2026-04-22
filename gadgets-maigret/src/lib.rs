@@ -25,7 +25,7 @@
 
 pub mod types;
 
-pub use types::{CheckOptions, CheckStatus, Progress, SiteCheckResult};
+pub use types::{CheckOptions, CheckStatus, Progress, ProgressBatch, SiteCheckResult, StatusCounts};
 
 #[cfg(feature = "native")]
 mod check;

@@ -381,9 +381,24 @@ pub struct ContextMenuState {
     pub screen_pos: (f64, f64),
 }
 
-/// One in-flight (or completed) gadget run. The results panel reads this to
-/// render live progress. `results` is appended to as `gadget-progress::*`
-/// events arrive from the backend.
+/// One in-flight (or completed) gadget run.
+///
+/// **Reactivity design.** Every field that changes during a run (progress
+/// counters, result list, status counts, spawned-nodes map, terminal
+/// flag) is stored as its own `RwSignal` — *not* as a plain value on the
+/// struct. Consequences:
+///
+///   * Pushing a result into `results` only invalidates the `results`
+///     signal. Code that only reads, say, `title` does **not** re-run.
+///   * The outer `AppState.gadget_runs: RwSignal<IndexMap<_, GadgetRun>>`
+///     only needs to fire on *structural* changes (a run is created or
+///     removed), not on every one of the ~3 000 progress events per run.
+///   * `GadgetRun: Clone` is cheap — signals are integer handles, so the
+///     whole struct is a handful of IDs + two `String`s.
+///
+/// Before this split, each progress tick fanned out to every observer of
+/// `gadget_runs`, which did O(N) work per tick and produced visible UI
+/// jank on ~3 000-site sweeps.
 #[derive(Clone, Debug)]
 pub struct GadgetRun {
     pub run_id: String,
@@ -392,19 +407,24 @@ pub struct GadgetRun {
     /// connection target when the user clicks a result to materialise it
     /// as a child node.
     pub source_node_id: NodeId,
-    pub completed: usize,
-    pub total: usize,
-    pub results: Vec<gadgets_maigret::SiteCheckResult>,
+    /// Completed / total site counters. Drive the progress bar.
+    pub completed: RwSignal<usize>,
+    pub total: RwSignal<usize>,
+    /// Append-only log of every site result that has arrived.
+    pub results: RwSignal<Vec<gadgets_maigret::SiteCheckResult>>,
+    /// Cached per-status counts — incrementally updated as each result
+    /// lands. Read by the filter pills in O(1).
+    pub counts: RwSignal<gadgets_maigret::StatusCounts>,
     /// Per-run map: `site name` → `NodeId` for every claimed result the
     /// user clicked to spawn as a graph node. Click-again removes the
     /// node and its edge, then drops the entry. If the user deletes the
     /// child node manually on the canvas we detect the stale `NodeId` on
     /// next toggle and fall through to re-add.
-    pub spawned_nodes: IndexMap<String, NodeId>,
+    pub spawned_nodes: RwSignal<IndexMap<String, NodeId>>,
     /// `true` once the backend command resolved. Either the final `results`
     /// Vec is set (Ok) or `error` is set (Err).
-    pub finished: bool,
-    pub error: Option<String>,
+    pub finished: RwSignal<bool>,
+    pub error: RwSignal<Option<String>>,
 }
 
 // ---------------------------------------------------------------------------

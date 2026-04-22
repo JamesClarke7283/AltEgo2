@@ -36,6 +36,19 @@ pub fn NodeView(node_id: NodeId) -> impl IntoView {
 
     let entity_kind = move || node().map(|n| n.entity_type);
 
+    // Favicon URL stored on the node, if any. Gadgets (e.g. the Maigret
+    // username sweep) set a `Favicon` property when spawning a child
+    // node so the canvas can render the site's favicon in place of the
+    // generic entity glyph.
+    let favicon = move || -> Option<String> {
+        node().and_then(|n| {
+            n.properties
+                .get("Favicon")
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+        })
+    };
+
     // ------------- interactions -------------
 
     let on_node_pointer_down = move |ev: web_sys::PointerEvent| {
@@ -128,15 +141,31 @@ pub fn NodeView(node_id: NodeId) -> impl IntoView {
                 stroke-width="1.5"
                 on:pointerdown=on_node_pointer_down
             />
-            // Entity icon (centred, 24×24). Ignore pointer events so the
-            // main circle receives them.
+            // Node glyph: prefer the per-node favicon (set by gadgets
+            // like the Maigret username sweep) and fall back to the
+            // entity-type SVG icon. `pointer-events:none` keeps clicks
+            // reaching the main circle.
             {move || {
-                entity_kind().map(|kind| view! {
-                    <g transform="translate(-12,-12)" style="pointer-events:none"
-                       class="text-zinc-700 dark:text-zinc-200">
-                        <EntityIcon entity=kind class="w-6 h-6".to_string() />
-                    </g>
-                })
+                if let Some(url) = favicon() {
+                    view! {
+                        <image
+                            href=url
+                            x="-16" y="-16" width="32" height="32"
+                            style="pointer-events:none"
+                            preserveAspectRatio="xMidYMid meet"
+                            // Rounded clip so the favicon visually fits
+                            // inside the node circle.
+                            clip-path="inset(0 round 6px)"
+                        />
+                    }.into_any()
+                } else {
+                    entity_kind().map(|kind| view! {
+                        <g transform="translate(-12,-12)" style="pointer-events:none"
+                           class="text-zinc-700 dark:text-zinc-200">
+                            <EntityIcon entity=kind class="w-6 h-6".to_string() />
+                        </g>
+                    }).into_any()
+                }
             }}
             // Label below
             <text

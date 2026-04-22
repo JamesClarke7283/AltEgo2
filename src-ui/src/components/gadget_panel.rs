@@ -4,24 +4,42 @@
 //! sweep runs (which takes ~60 s for Maigret's 3 000-site DB). The user
 //! can dismiss via the × button, in which case the run keeps going in the
 //! background and the results remain available via `state.gadget_runs`.
+//!
+//! ## Reactivity notes
+//!
+//! Every mutable field on `GadgetRun` is an `RwSignal`, so a progress
+//! update only invalidates the specific signal(s) that changed — not the
+//! outer `gadget_runs` map. Combined with a Leptos `<For/>` keyed by site
+//! name, a new result causes O(1) DOM work (append one row) instead of
+//! O(N) (rebuild the entire list).
+//!
+//! `counts` is kept as a cached struct on the run and incrementally
+//! bumped as each result arrives, so filter-pill badges are O(1) reads.
 
 use leptos::prelude::*;
 
-use gadgets_maigret::{CheckStatus, SiteCheckResult};
+use gadgets_maigret::{CheckStatus, SiteCheckResult, StatusCounts};
 
 use crate::state::{AppState, EntityType, GadgetRun, NodeId};
 
 #[component]
 pub fn GadgetPanel() -> impl IntoView {
     let state = AppState::expect();
-
     let visible = move || state.active_gadget_run.get().is_some();
-
     view! {
         <Show when=visible fallback=|| ()>
             <PanelBody />
         </Show>
     }
+}
+
+/// Look up the currently-active `GadgetRun` by id. Returns `None` if the
+/// panel is closed or the run was cleared from the map. Only tracks
+/// *structural* changes to `gadget_runs` (add/remove), not the signals
+/// inside each run.
+fn active_run(state: AppState) -> Option<GadgetRun> {
+    let id = state.active_gadget_run.get()?;
+    state.gadget_runs.with(|m| m.get(&id).cloned())
 }
 
 #[component]
@@ -35,16 +53,13 @@ fn PanelBody() -> impl IntoView {
     let show_unknown = RwSignal::new(false);
     let show_error = RwSignal::new(false);
 
-    let current = move || -> Option<GadgetRun> {
-        let id = state.active_gadget_run.get()?;
-        state.gadget_runs.with(|m| m.get(&id).cloned())
-    };
-
-    let title = move || current().map(|r| r.title).unwrap_or_default();
-    let completed = move || current().map(|r| r.completed).unwrap_or(0);
-    let total = move || current().map(|r| r.total).unwrap_or(0);
-    let finished = move || current().map(|r| r.finished).unwrap_or(false);
-    let error = move || current().and_then(|r| r.error.clone());
+    // Header-level readouts. Each of these only re-runs when *its* signal
+    // changes — e.g. the title closure never re-runs during a sweep.
+    let title = move || active_run(state).map(|r| r.title.clone()).unwrap_or_default();
+    let completed = move || active_run(state).map(|r| r.completed.get()).unwrap_or(0);
+    let total = move || active_run(state).map(|r| r.total.get()).unwrap_or(0);
+    let finished = move || active_run(state).map(|r| r.finished.get()).unwrap_or(false);
+    let error = move || active_run(state).and_then(|r| r.error.get());
 
     let progress_fraction = move || {
         let t = total();
@@ -57,24 +72,10 @@ fn PanelBody() -> impl IntoView {
 
     let close = move |_| state.active_gadget_run.set(None);
 
-    let counts = move || -> (usize, usize, usize, usize) {
-        let Some(run) = current() else {
-            return (0, 0, 0, 0);
-        };
-        let mut claimed = 0;
-        let mut available = 0;
-        let mut unknown = 0;
-        let mut error = 0;
-        for r in &run.results {
-            match r.status {
-                CheckStatus::Claimed => claimed += 1,
-                CheckStatus::Available => available += 1,
-                CheckStatus::Unknown { .. } | CheckStatus::Invalid { .. } => unknown += 1,
-                CheckStatus::Error { .. } => error += 1,
-            }
-        }
-        (claimed, available, unknown, error)
-    };
+    // Cached counts — O(1) pill updates.
+    let counts: Signal<StatusCounts> = Signal::derive(move || {
+        active_run(state).map(|r| r.counts.get()).unwrap_or_default()
+    });
 
     view! {
         <div
@@ -84,7 +85,7 @@ fn PanelBody() -> impl IntoView {
                    border border-zinc-200 dark:border-zinc-700 \
                    text-sm text-zinc-700 dark:text-zinc-200 \
                    z-[999]"
-            style="backdrop-filter: blur(6px);"
+            style="backdrop-filter: blur(6px); contain: layout paint;"
         >
             // Header
             <div class="flex items-center gap-2 px-3 py-2 \
@@ -101,26 +102,36 @@ fn PanelBody() -> impl IntoView {
                 >"×"</button>
             </div>
 
-            // Progress bar
+            // Progress bar — CSS transition smooths the jumps between
+            // 30 Hz backend flushes.
             <div class="h-1 bg-zinc-200 dark:bg-zinc-800 overflow-hidden">
                 <div
-                    class="h-full bg-orange-500 transition-all"
-                    style=move || format!("width: {:.1}%", progress_fraction() * 100.0)
+                    class="h-full bg-orange-500"
+                    style=move || format!(
+                        "width: {:.1}%; transition: width 120ms linear;",
+                        progress_fraction() * 100.0
+                    )
                 />
             </div>
 
-            // Filter pills
+            // Filter pills — each reads the pre-computed count signal in
+            // O(1); no iteration over the result list.
             <div class="flex flex-wrap gap-1.5 px-3 py-2 \
                         border-b border-zinc-200 dark:border-zinc-700 \
                         text-[11px]">
-                <FilterPill label="Claimed" color="emerald" signal=show_claimed count=Signal::derive(move || counts().0) />
-                <FilterPill label="Available" color="zinc" signal=show_available count=Signal::derive(move || counts().1) />
-                <FilterPill label="Unknown" color="amber" signal=show_unknown count=Signal::derive(move || counts().2) />
-                <FilterPill label="Error" color="rose" signal=show_error count=Signal::derive(move || counts().3) />
+                <FilterPill label="Claimed" color="emerald" signal=show_claimed
+                    count=Signal::derive(move || counts.get().claimed) />
+                <FilterPill label="Available" color="zinc" signal=show_available
+                    count=Signal::derive(move || counts.get().available) />
+                <FilterPill label="Unknown" color="amber" signal=show_unknown
+                    count=Signal::derive(move || counts.get().unknown) />
+                <FilterPill label="Error" color="rose" signal=show_error
+                    count=Signal::derive(move || counts.get().error) />
             </div>
 
             // Body
-            <div class="flex-1 overflow-y-auto">
+            <div class="flex-1 overflow-y-auto"
+                 style="overscroll-behavior: contain; scrollbar-gutter: stable;">
                 {move || {
                     if let Some(err) = error() {
                         view! {
@@ -195,30 +206,36 @@ fn ResultsList(
     error: Signal<bool>,
 ) -> impl IntoView {
     let state = AppState::expect();
-    let run_results = move || -> Vec<SiteCheckResult> {
-        let Some(id) = state.active_gadget_run.get() else {
+
+    // Memo: the filtered list. Re-evaluates only when:
+    //   * `active_gadget_run` changes (user switched run / closed panel)
+    //   * the run's `results` signal changes (new batch arrived)
+    //   * any of the four filter toggles flips
+    //
+    // `<For/>` then diffs this Vec against its previous value by key, so
+    // DOM work is proportional to the *delta*, not the whole list.
+    let filtered = Memo::new(move |_| -> Vec<SiteCheckResult> {
+        let Some(run) = active_run(state) else {
             return Vec::new();
         };
-        state.gadget_runs.with(|m| {
-            m.get(&id).map(|r| r.results.clone()).unwrap_or_default()
+        let (c, a, u, e) = (claimed.get(), available.get(), unknown.get(), error.get());
+        run.results.with(|all| {
+            all.iter()
+                .filter(|r| match r.status {
+                    CheckStatus::Claimed => c,
+                    CheckStatus::Available => a,
+                    CheckStatus::Unknown { .. } | CheckStatus::Invalid { .. } => u,
+                    CheckStatus::Error { .. } => e,
+                })
+                .cloned()
+                .collect()
         })
-    };
-
-    let filtered = move || -> Vec<SiteCheckResult> {
-        let mut items = run_results();
-        items.retain(|r| match r.status {
-            CheckStatus::Claimed => claimed.get(),
-            CheckStatus::Available => available.get(),
-            CheckStatus::Unknown { .. } | CheckStatus::Invalid { .. } => unknown.get(),
-            CheckStatus::Error { .. } => error.get(),
-        });
-        items
-    };
+    });
 
     view! {
         {move || {
-            let items = filtered();
-            if items.is_empty() {
+            let is_empty = filtered.with(|v| v.is_empty());
+            if is_empty {
                 view! {
                     <div class="p-3 italic text-zinc-400 dark:text-zinc-500">
                         "No results match the current filters."
@@ -227,9 +244,13 @@ fn ResultsList(
             } else {
                 view! {
                     <ul class="divide-y divide-zinc-200 dark:divide-zinc-800">
-                        {items.into_iter().map(|r| view! {
-                            <ResultRow result=r />
-                        }).collect_view()}
+                        <For
+                            each=move || filtered.get()
+                            key=|r| r.site.clone()
+                            let:result
+                        >
+                            <ResultRow result=result />
+                        </For>
                     </ul>
                 }.into_any()
             }
@@ -256,43 +277,32 @@ fn ResultRow(result: SiteCheckResult) -> impl IntoView {
     };
     let is_claimed = matches!(result.status, CheckStatus::Claimed);
 
-    // Reactive: is this site currently materialised as a child node? The
-    // panel re-renders any time `state.gadget_runs` changes, so the
-    // badge / background flip automatically after a toggle.
-    //
-    // `Signal::derive` gives us a `Copy` handle, so the three view
-    // closures below can each call `is_spawned.get()` without needing to
-    // clone the underlying closure.
+    // Reactive: is this site currently materialised as a child node? Only
+    // re-runs when `spawned_nodes` or `nodes` change — not when new
+    // results arrive on other sites.
     let site_for_lookup = result.site.clone();
     let is_spawned: Signal<bool> = Signal::derive(move || {
-        let Some(rid) = state.active_gadget_run.get() else {
+        let Some(run) = active_run(state) else {
             return false;
         };
-        state
-            .gadget_runs
-            .with(|m| {
-                m.get(&rid)
-                    .map(|r| r.spawned_nodes.get(&site_for_lookup).copied())
-            })
-            .flatten()
-            .map(|id| state.nodes.with(|nodes| nodes.contains_key(&id)))
-            .unwrap_or(false)
+        let node_id = run
+            .spawned_nodes
+            .with(|m| m.get(&site_for_lookup).copied());
+        let Some(id) = node_id else { return false };
+        state.nodes.with(|nodes| nodes.contains_key(&id))
     });
 
-    // Click: Claimed → toggle spawn/despawn. Otherwise → open URL in a
-    // browser tab (informational rows stay clickable as a convenience).
     let site_for_click = result.site.clone();
     let url_for_click = result.url.clone();
+    let url_for_fav = result.url.clone();
     let on_click = move |_: web_sys::MouseEvent| {
         if is_claimed {
-            toggle_spawn(state, &site_for_click, &url_for_click);
+            toggle_spawn(state, &site_for_click, &url_for_click, &url_for_fav);
         } else if let Some(w) = web_sys::window() {
             let _ = w.open_with_url_and_target(&url_for_click, "_blank");
         }
     };
 
-    // Row chrome shifts when spawned so users can see at a glance which
-    // claimed results they've pulled into the graph.
     let row_class = move || {
         let base = "px-3 py-2 cursor-pointer transition-colors";
         if is_spawned.get() {
@@ -354,78 +364,62 @@ fn ResultRow(result: SiteCheckResult) -> impl IntoView {
 }
 
 /// Toggle whether the given site is materialised as a child node under the
-/// active run's source Alias.
-///
-/// Four cases:
-///   1. Tracked & node still exists on canvas → remove node + untrack.
-///   2. Tracked but node was manually deleted  → untrack + add fresh.
-///   3. Not tracked, source still exists       → add + track.
-///   4. Not tracked, source was deleted        → alert user, no-op.
-///
-/// New child nodes are placed in an expanding arc around the source so the
-/// first 8 spawn without overlapping, and overflow rings out further.
-fn toggle_spawn(state: AppState, site: &str, url: &str) {
+/// active run's source Alias. Details + four cases: see previous commit
+/// (file history) — behaviour is unchanged, this version only swaps the
+/// `results`/`spawned_nodes` reads from struct fields to signals.
+fn toggle_spawn(state: AppState, site: &str, url: &str, favicon_source_url: &str) {
     let Some(run_id) = state.active_gadget_run.get_untracked() else {
         return;
     };
 
-    // Read run context (source id, existing spawn, spawn count).
-    let (tracked_id, source_id, spawn_count): (Option<NodeId>, Option<NodeId>, usize) = state
+    let Some(run) = state
         .gadget_runs
-        .with_untracked(|m| match m.get(&run_id) {
-            Some(r) => (
-                r.spawned_nodes.get(site).copied(),
-                Some(r.source_node_id),
-                r.spawned_nodes.len(),
-            ),
-            None => (None, None, 0),
-        });
+        .with_untracked(|m| m.get(&run_id).cloned())
+    else {
+        return;
+    };
 
-    // Decide whether we're removing or adding.
+    let tracked_id: Option<NodeId> = run
+        .spawned_nodes
+        .with_untracked(|m| m.get(site).copied());
+    let spawn_count: usize = run.spawned_nodes.with_untracked(|m| m.len());
+    let source_id: NodeId = run.source_node_id;
+
     let node_still_exists = tracked_id
         .map(|id| state.nodes.with_untracked(|n| n.contains_key(&id)))
         .unwrap_or(false);
 
     if tracked_id.is_some() && node_still_exists {
-        // --- Case 1: remove ---
+        // --- remove ---
         if let Some(id) = tracked_id {
             state.remove_node(id);
         }
-        state.gadget_runs.update(|m| {
-            if let Some(r) = m.get_mut(&run_id) {
-                r.spawned_nodes.shift_remove(site);
-            }
+        run.spawned_nodes.update(|m| {
+            m.shift_remove(site);
         });
         return;
     }
 
-    // --- Cases 2 / 3 / 4: we need to add ---
-    let Some(source_id) = source_id else { return };
+    // --- add ---
     let source_pos = state
         .nodes
         .with_untracked(|n| n.get(&source_id).map(|node| node.position));
     let Some(source_pos) = source_pos else {
-        // Case 4: source was deleted; can't attach.
         if let Some(w) = web_sys::window() {
             let _ = w.alert_with_message(
                 "The source Alias node has been deleted — can't attach a new child node.",
             );
         }
-        // Clear any stale tracking so the UI doesn't keep insisting the
-        // row is spawned.
         if tracked_id.is_some() {
-            state.gadget_runs.update(|m| {
-                if let Some(r) = m.get_mut(&run_id) {
-                    r.spawned_nodes.shift_remove(site);
-                }
+            run.spawned_nodes.update(|m| {
+                m.shift_remove(site);
             });
         }
         return;
     };
 
-    // Arc placement: golden-angle increments keep the first ~20 children
-    // from colliding without any bookkeeping per slot. Radius bumps out
-    // every 8 spawns so later rounds don't overlap earlier ones.
+    // Golden-angle arc around the source Alias; rings out every 8 spawns
+    // so later rounds don't overlap earlier ones.
     let count = spawn_count as f64;
     let angle_deg = (count * 137.5) % 360.0;
     let angle = angle_deg.to_radians();
@@ -435,16 +429,20 @@ fn toggle_spawn(state: AppState, site: &str, url: &str) {
         source_pos.1 + radius * angle.sin(),
     );
 
+    let favicon = crate::gadgets::favicon_url(favicon_source_url);
     let new_id = state.add_node_with_properties(
         EntityType::Affiliation,
         pos,
-        &[("Name", site), ("Network", site), ("Profile URL", url)],
+        &[
+            ("Name", site),
+            ("Network", site),
+            ("Profile URL", url),
+            ("Favicon", favicon.as_deref().unwrap_or("")),
+        ],
     );
     let _ = state.add_edge(source_id, new_id);
 
-    state.gadget_runs.update(|m| {
-        if let Some(r) = m.get_mut(&run_id) {
-            r.spawned_nodes.insert(site.to_string(), new_id);
-        }
+    run.spawned_nodes.update(|m| {
+        m.insert(site.to_string(), new_id);
     });
 }
