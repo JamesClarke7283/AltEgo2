@@ -81,3 +81,37 @@ pub async fn load_graph() -> Result<Option<LoadedGraph>, String> {
         Err(js) => Err(format!("{js:?}")),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Gadgets
+// ---------------------------------------------------------------------------
+
+#[derive(Serialize)]
+struct GadgetCheckArgs {
+    #[serde(rename = "runId")]
+    run_id: String,
+    username: String,
+}
+
+/// Kick off the Maigret username sweep. The backend emits
+/// `gadget-progress::<run_id>` events while it runs, and this future
+/// resolves with the final sorted `Vec<SiteCheckResult>` when the sweep
+/// finishes (or an `Err(String)` on a hard failure such as malformed
+/// site DB).
+///
+/// The caller is expected to subscribe to the progress event *before*
+/// invoking, using `tauri_wasm_rs::api::event::listen`.
+pub async fn gadget_check_username_streaming(
+    run_id: String,
+    username: String,
+) -> Result<Vec<gadgets_maigret::SiteCheckResult>, String> {
+    match invoke::<_, Vec<gadgets_maigret::SiteCheckResult>>(
+        "gadget_check_username_streaming",
+        &GadgetCheckArgs { run_id, username },
+    )
+    .await
+    {
+        Ok(v) => Ok(v),
+        Err(js) => Err(format!("{js:?}")),
+    }
+}

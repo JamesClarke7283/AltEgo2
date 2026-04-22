@@ -367,6 +367,47 @@ pub enum DragKind {
 }
 
 // ---------------------------------------------------------------------------
+// Gadgets (right-click "transforms" on nodes).
+// ---------------------------------------------------------------------------
+
+/// Where the right-click context menu is anchored and which node owns it.
+/// `screen_pos` is *viewport* coordinates (what `MouseEvent::client_x/y`
+/// returns), not world coordinates, because the menu is a `position:fixed`
+/// overlay outside the SVG viewport transform.
+#[derive(Clone, Debug)]
+pub struct ContextMenuState {
+    pub node_id: NodeId,
+    pub entity_type: EntityType,
+    pub screen_pos: (f64, f64),
+}
+
+/// One in-flight (or completed) gadget run. The results panel reads this to
+/// render live progress. `results` is appended to as `gadget-progress::*`
+/// events arrive from the backend.
+#[derive(Clone, Debug)]
+pub struct GadgetRun {
+    pub run_id: String,
+    pub title: String,
+    /// The node the gadget was launched from (the Alias). Used as the
+    /// connection target when the user clicks a result to materialise it
+    /// as a child node.
+    pub source_node_id: NodeId,
+    pub completed: usize,
+    pub total: usize,
+    pub results: Vec<gadgets_maigret::SiteCheckResult>,
+    /// Per-run map: `site name` → `NodeId` for every claimed result the
+    /// user clicked to spawn as a graph node. Click-again removes the
+    /// node and its edge, then drops the entry. If the user deletes the
+    /// child node manually on the canvas we detect the stale `NodeId` on
+    /// next toggle and fall through to re-add.
+    pub spawned_nodes: IndexMap<String, NodeId>,
+    /// `true` once the backend command resolved. Either the final `results`
+    /// Vec is set (Ok) or `error` is set (Err).
+    pub finished: bool,
+    pub error: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
 // AppState
 // ---------------------------------------------------------------------------
 
@@ -386,6 +427,15 @@ pub struct AppState {
     /// when the graph has never been saved. `File → Save` writes to this
     /// path silently when it's `Some`; `Save As…` always reassigns it.
     pub current_file_path: RwSignal<Option<String>>,
+    // --------- gadgets (right-click actions on nodes) ---------
+    /// The node-level right-click menu. `Some` while the menu is open.
+    pub context_menu: RwSignal<Option<ContextMenuState>>,
+    /// Every gadget run ever spawned in this session, keyed by run_id.
+    /// Kept so the user can re-open a previous run after minimising it.
+    pub gadget_runs: RwSignal<IndexMap<String, GadgetRun>>,
+    /// Which gadget run the bottom-right results panel is displaying.
+    /// `None` = panel hidden.
+    pub active_gadget_run: RwSignal<Option<String>>,
 }
 
 impl AppState {
@@ -402,6 +452,9 @@ impl AppState {
             next_node_id: RwSignal::new(1),
             next_edge_id: RwSignal::new(1),
             current_file_path: RwSignal::new(None),
+            context_menu: RwSignal::new(None),
+            gadget_runs: RwSignal::new(IndexMap::new()),
+            active_gadget_run: RwSignal::new(None),
         }
     }
 
@@ -427,6 +480,61 @@ impl AppState {
         });
         self.selection.set(Selection::Node(id));
         id
+    }
+
+    /// Like `add_node`, but with caller-supplied property values. Any
+    /// property keys not in the entity's default schema are appended at
+    /// the end; missing keys retain their default empty string. Does not
+    /// change selection (unlike `add_node`, which picks the new node) —
+    /// gadgets that spawn many children shouldn't scroll the sidebar.
+    pub fn add_node_with_properties(
+        &self,
+        entity_type: EntityType,
+        position: (f64, f64),
+        overrides: &[(&str, &str)],
+    ) -> NodeId {
+        let id = NodeId(self.next_node_id.get_untracked());
+        self.next_node_id.update(|n| *n += 1);
+        let mut properties = entity_type.default_properties();
+        for (k, v) in overrides {
+            // IndexMap::insert overwrites existing keys and preserves
+            // insertion order for new ones.
+            properties.insert((*k).to_string(), (*v).to_string());
+        }
+        let node = Node {
+            id,
+            entity_type,
+            position,
+            properties,
+        };
+        self.nodes.update(|m| {
+            m.insert(id, node);
+        });
+        id
+    }
+
+    /// Remove a node by id, also pruning every edge that touches it.
+    /// No-op if the node doesn't exist. Returns `true` iff something was
+    /// actually removed.
+    pub fn remove_node(&self, id: NodeId) -> bool {
+        let existed = self
+            .nodes
+            .with_untracked(|m| m.contains_key(&id));
+        if !existed {
+            return false;
+        }
+        self.nodes.update(|m| {
+            m.shift_remove(&id);
+        });
+        // Drop dangling edges.
+        self.edges.update(|m| {
+            m.retain(|_, e| e.from != id && e.to != id);
+        });
+        // If the removed node was selected, clear the selection.
+        if self.selection.get_untracked() == Selection::Node(id) {
+            self.selection.set(Selection::None);
+        }
+        true
     }
 
     pub fn add_edge(&self, from: NodeId, to: NodeId) -> Option<EdgeId> {

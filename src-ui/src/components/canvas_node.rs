@@ -4,7 +4,7 @@ use leptos::prelude::*;
 use wasm_bindgen::JsCast;
 
 use crate::components::icons::EntityIcon;
-use crate::state::{AppState, DragKind, Node, NodeId, Selection};
+use crate::state::{AppState, ContextMenuState, DragKind, Node, NodeId, Selection};
 
 #[component]
 pub fn NodeView(node_id: NodeId) -> impl IntoView {
@@ -87,6 +87,25 @@ pub fn NodeView(node_id: NodeId) -> impl IntoView {
         }
     };
 
+    // Right-click: open the gadgets context menu anchored at the cursor.
+    let on_context_menu = move |ev: web_sys::MouseEvent| {
+        // Suppress the native WebView context menu — we render our own.
+        ev.prevent_default();
+        ev.stop_propagation();
+        let entity = state
+            .nodes
+            .with_untracked(|m| m.get(&node_id).map(|n| n.entity_type));
+        let Some(kind) = entity else { return };
+        // Select the node so the user has visual confirmation of the
+        // target, and so the results panel can cross-reference selection.
+        state.selection.set(Selection::Node(node_id));
+        state.context_menu.set(Some(ContextMenuState {
+            node_id,
+            entity_type: kind,
+            screen_pos: (ev.client_x() as f64, ev.client_y() as f64),
+        }));
+    };
+
     let ring_visible = move || selected();
     let handle_visible = move || selected() || hovered();
 
@@ -96,6 +115,7 @@ pub fn NodeView(node_id: NodeId) -> impl IntoView {
             data-node-id=node_id.0.to_string()
             on:mouseenter=on_mouse_enter
             on:mouseleave=on_mouse_leave
+            on:contextmenu=on_context_menu
         >
             // Selection ring
             <Show when=ring_visible fallback=|| ()>

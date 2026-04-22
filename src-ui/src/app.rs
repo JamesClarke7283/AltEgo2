@@ -4,6 +4,8 @@
 use leptos::prelude::*;
 
 use crate::components::canvas::Canvas;
+use crate::components::context_menu::NodeContextMenu;
+use crate::components::gadget_panel::GadgetPanel;
 use crate::components::menu_bar::MenuBar;
 use crate::components::palette::EntityPalette;
 use crate::components::right_sidebar::RightSidebar;
@@ -29,6 +31,12 @@ pub fn App() -> impl IntoView {
                 <Canvas />
                 <RightSidebar />
             </div>
+            // Overlay layer — context menu + gadget results panel.
+            // Rendered as siblings of the main layout so their
+            // `position: fixed` is relative to the viewport, not the flex
+            // row that holds the canvas and sidebars.
+            <NodeContextMenu />
+            <GadgetPanel />
         </div>
     }
 }

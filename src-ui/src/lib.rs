@@ -2,6 +2,7 @@
 
 pub mod app;
 pub mod components;
+pub mod gadgets;
 pub mod state;
 pub mod tauri_bridge;
 pub mod theme;

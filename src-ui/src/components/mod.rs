@@ -4,6 +4,8 @@ pub mod canvas;
 pub mod canvas_edge;
 pub mod canvas_grid;
 pub mod canvas_node;
+pub mod context_menu;
+pub mod gadget_panel;
 pub mod icons;
 pub mod menu_bar;
 pub mod palette;

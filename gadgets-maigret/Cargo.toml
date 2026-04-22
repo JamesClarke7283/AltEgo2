@@ -1,0 +1,46 @@
+[package]
+name = "gadgets-maigret"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.1"
+description = "Maigret-powered username-sweep gadget for AltEgo 2."
+license = "AGPL-3.0-or-later"
+
+[features]
+# "native" pulls the HTTP/async stack (reqwest + tokio + regex + futures).
+# The frontend depends on this crate with `default-features = false` so only
+# the serde types compile for `wasm32-unknown-unknown`.
+default = ["native"]
+native = [
+    "dep:reqwest",
+    "dep:tokio",
+    "dep:regex",
+    "dep:futures",
+    "dep:percent-encoding",
+    "dep:log",
+]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "gzip",
+    "brotli",
+    "stream",
+], optional = true }
+tokio = { version = "1", features = [
+    "sync",
+    "time",
+    "rt",
+    "rt-multi-thread",
+    "macros",
+], optional = true }
+regex = { version = "1", optional = true }
+futures = { version = "0.3", optional = true }
+percent-encoding = { version = "2", optional = true }
+log = { version = "0.4", optional = true }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }

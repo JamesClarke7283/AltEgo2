@@ -3,7 +3,8 @@
     windows_subsystem = "windows"
 )]
 
-use tauri::{AppHandle, Window};
+use gadgets_maigret::{CheckOptions, Progress, SiteCheckResult};
+use tauri::{AppHandle, Emitter, Window};
 use tauri_plugin_dialog::DialogExt;
 
 // ---------------------------------------------------------------------------
@@ -108,6 +109,42 @@ async fn load_graph(app: AppHandle) -> Result<Option<LoadedGraph>, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Gadgets — backend wrappers around `gadgets-maigret`.
+// ---------------------------------------------------------------------------
+
+/// One-shot username sweep. Blocks (async) until every site is checked and
+/// returns the full list. Kept mainly for tests / automation; the UI uses
+/// the streaming variant below so the user sees hits arrive in real time.
+#[tauri::command]
+async fn gadget_check_username(username: String) -> Result<Vec<SiteCheckResult>, String> {
+    gadgets_maigret::check_username(&username).await
+}
+
+/// Streaming username sweep. Emits `gadget-progress::<run_id>` Tauri events
+/// as each site finishes, then resolves with the final sorted `Vec`.
+///
+/// The frontend supplies `run_id` (any opaque string) before invoking, so
+/// it can subscribe to the per-run event channel *before* results start
+/// arriving. We spawn a small forwarder task that drains the mpsc channel
+/// into `app.emit(...)` — this decouples the Maigret runner from Tauri.
+#[tauri::command]
+async fn gadget_check_username_streaming(
+    app: AppHandle,
+    run_id: String,
+    username: String,
+) -> Result<Vec<SiteCheckResult>, String> {
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<Progress>(64);
+    let progress_event = format!("gadget-progress::{run_id}");
+    let app_bg = app.clone();
+    tokio::spawn(async move {
+        while let Some(p) = rx.recv().await {
+            let _ = app_bg.emit(&progress_event, &p);
+        }
+    });
+    gadgets_maigret::check_username_streaming(&username, CheckOptions::default(), tx).await
+}
+
+// ---------------------------------------------------------------------------
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -121,6 +158,8 @@ pub fn run() {
             save_graph,
             save_graph_to,
             load_graph,
+            gadget_check_username,
+            gadget_check_username_streaming,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

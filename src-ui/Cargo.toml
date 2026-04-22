@@ -21,6 +21,9 @@ tauri-wasm-rs = { git = "https://github.com/p1mo/tauri-wasm", tag = "v0.1.3-dev"
 ] }
 futures = "0.3"
 indexmap = { version = "2", features = ["serde"] }
+# Frontend only needs the serde types — no reqwest / tokio in the WASM
+# bundle. `default-features = false` disables the `native` feature.
+gadgets-maigret = { path = "../gadgets-maigret", default-features = false }
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"
